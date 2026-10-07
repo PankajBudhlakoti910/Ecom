@@ -9,3 +9,4 @@ psutil>=5.9.0
 requests>=2.28.0
 python-dotenv
 pyodbc
+sqlalchemy>=2.0.0
