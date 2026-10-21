@@ -98,7 +98,7 @@ with col_sync:
     st.write("") # Spacing
     if st.button("🔄 Sync & Refresh Data", use_container_width=True, help="Clear cache and fetch latest BQ and Sheet data"):
         st.cache_data.clear()
-        for key in ["scope_data", "master_sql_df", "gsheet_data", "url_master_df"]:
+        for key in ["_bq_master_scope", "master_scope_df", "scope_data", "master_sql_df", "cached_gsheet_df", "gsheet_data", "master_gsheet_df", "url_master_df"]:
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -185,12 +185,18 @@ def create_search_url(row, brand_col, product_col, mapping_df):
         return f"{base_link}?query={encoded_query}"
     else: return f"{base_link}/search?q={encoded_query}"
 
-# ── 3. SMART TIMED LOADING (Client + Master Isolation) ─────────────────────────
+# ── 3. ROBUST SESSION-BOUND DATA LOADING ─────────────────────────────────────
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def get_optimized_matrix_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # 1. BQ Expected Scope
-    scope = st.session_state.get("scope_data", pd.DataFrame())
+@st.cache_data(show_spinner=False)
+def get_session_matrix_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Retrieves data across all valid session key aliases without blocking BQ fallbacks."""
+    # 1. BQ Expected Scope (Checking all possible key aliases)
+    scope = pd.DataFrame()
+    for k in ["_bq_master_scope", "master_scope_df", "scope_data"]:
+        val = st.session_state.get(k)
+        if isinstance(val, pd.DataFrame) and not val.empty:
+            scope = val
+            break
     
     # 2. Final Client Deliverable Data (Available)
     client = pd.DataFrame()
@@ -202,56 +208,78 @@ def get_optimized_matrix_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
     # 3. Master SQL Records (Not yet in Client)
     master = st.session_state.get("master_sql_df", st.session_state.get("_sku_active_df", pd.DataFrame()))
         
-    # 4. Excluded GSheet Data
-    gsheet = st.session_state.get("gsheet_data", pd.DataFrame())
+    # 4. Excluded GSheet Data (Checking all possible key aliases)
+    gsheet = pd.DataFrame()
+    for k in ["cached_gsheet_df", "gsheet_data", "master_gsheet_df"]:
+        val = st.session_state.get(k)
+        if isinstance(val, pd.DataFrame) and not val.empty:
+            gsheet = val
+            break
     
-    # Fallback Data Pull if essential data is missing
-    if scope.empty or master.empty:
-        fetched_scope, fetched_sql, fetched_gsheet = get_global_master_data()
-        scope = fetched_scope if fetched_scope is not None and not fetched_scope.empty else scope
-        master = fetched_sql if fetched_sql is not None and not fetched_sql.empty else master
-        gsheet = fetched_gsheet if fetched_gsheet is not None and not fetched_gsheet.empty else gsheet
-        
     return scope, client, master, gsheet
 
-# Pre-initialize globals to prevent NameError
+# Pre-initialize globals
 scope_df, client_df, master_df, gsheet_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 total_start_time = time.time()
 
-with st.status("🚀 Initializing Pipeline (Scope ➔ Master ➔ Client)...", expanded=False) as status:
-    st.write("📥 Fetching Data Layers...")
+scope_df, client_df, master_df, gsheet_df = get_session_matrix_data()
+
+# Add Platform Type to Scope if available
+if not scope_df.empty and 'PlatformType' not in scope_df.columns:
+    scope_df = scope_df.merge(master_url_df[['CountryName', 'Ecom_Source', 'PlatformType']], on=['CountryName', 'Ecom_Source'], how='left')
+    scope_df['PlatformType'] = scope_df['PlatformType'].fillna("Unknown")
+
+# Status expander for pipeline visibility
+with st.expander("📊 Data Pipeline Status (Session-Bound)", expanded=False):
+    if not scope_df.empty: 
+        st.success(f"✅ **BQ Expected Scope:** Loaded ({len(scope_df):,} records)")
+    else: 
+        st.warning("⚠️ **BQ Expected Scope:** Not found in session.")
+
+    if not client_df.empty: 
+        st.success(f"✅ **Client Table (Available):** Loaded ({len(client_df):,} records)")
+    else: 
+        st.warning("ℹ️ **Client Table:** Not in session (Treating as unfulfilled)")
+
+    if not master_df.empty: 
+        st.success(f"✅ **SQL Master Records:** Loaded ({len(master_df):,} records)")
+    else: 
+        st.warning("ℹ️ **SQL Master Records:** Not in session")
+
+    if not gsheet_df.empty: 
+        st.success(f"✅ **GSheet Exclusions:** Loaded ({len(gsheet_df):,} records)")
+    else: 
+        st.warning("ℹ️ **GSheet Exclusions:** Not in session")
+
+# Graceful fallback if scope_df is empty
+if scope_df.empty:
+    st.markdown("---")
+    st.warning("⚠️ **`scope_data` / `_bq_master_scope` is missing from `st.session_state`.** Click below to fetch global master data or upload scope dataset.")
     
-    try:
-        scope_df, client_df, master_df, gsheet_df = get_optimized_matrix_data()
-        
-        # Add Platform Type to Scope if available
-        if not scope_df.empty and 'PlatformType' not in scope_df.columns:
-            scope_df = scope_df.merge(master_url_df[['CountryName', 'Ecom_Source', 'PlatformType']], on=['CountryName', 'Ecom_Source'], how='left')
-            scope_df['PlatformType'] = scope_df['PlatformType'].fillna("Unknown")
-        
-        with st.expander("📊 Data Pipeline Status", expanded=True):
-            if not scope_df.empty: st.success(f"✅ **BQ Expected Scope:** Loaded ({len(scope_df):,} records)")
-            else: st.warning("⚠️ **BQ Expected Scope:** Skipped")
+    c_btn1, c_btn2 = st.columns(2)
+    with c_btn1:
+        if st.button("📥 Fetch Global Master Data Now", use_container_width=True):
+            with st.spinner("Fetching BigQuery scope & GSheet data..."):
+                s_df, sql_df, gs_df = get_global_master_data()
+                if not s_df.empty:
+                    st.session_state["_bq_master_scope"] = s_df
+                    st.success("Successfully fetched scope data! Refreshing...")
+                    st.rerun()
+                else:
+                    st.error("Failed to retrieve scope data from BigQuery.")
+    with c_btn2:
+        uploaded_scope = st.file_uploader("Or upload Expected Scope (CSV/Excel)", type=["csv", "xlsx"], key="inline_scope_upload")
+        if uploaded_scope is not None:
+            try:
+                scope_df = pd.read_csv(uploaded_scope) if uploaded_scope.name.endswith('.csv') else pd.read_excel(uploaded_scope)
+                st.session_state["_bq_master_scope"] = scope_df
+                st.success("Successfully loaded Scope Data! Refreshing...")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+    st.stop()
 
-            if not client_df.empty: st.success(f"✅ **Client Table (Available):** Loaded ({len(client_df):,} records)")
-            else: st.warning("⚠️ **Client Table:** Missing (Ensure Weekly Deliverables page is loaded)")
-
-            if not master_df.empty: st.success(f"✅ **SQL Master Records:** Loaded ({len(master_df):,} records)")
-            else: st.warning("⚠️ **SQL Master Records:** Missing (Ensure Home Dashboard is loaded)")
-
-            if not gsheet_df.empty: st.success(f"✅ **GSheet Exclusions:** Loaded ({len(gsheet_df):,} records)")
-            else: st.warning("⚠️ **GSheet Exclusions:** Skipped")
-
-    except Exception as e:
-        st.write(f"⚠️ Pipeline error: {e}")
-
-    if scope_df.empty:
-        status.update(label="⚠️ Pipeline Paused: Missing Expected Scope Data", state="error", expanded=True)
-        st.stop()
-    else:
-        status.update(label=f"🎉 Pipeline Ready! (Loaded in {time.time() - total_start_time:.2f}s)", state="complete", expanded=False)
-
-# ── 4. DYNAMIC MATCH KEY CONFIGURATION (WITH PREVIEW & AUTO-NAMES) ─────────────
+# ── 4. DYNAMIC MATCH KEY CONFIGURATION ────────────────────────────────────────
 st.markdown('<div class="section-header">🔑 Dynamic Match Key Configuration</div>', unsafe_allow_html=True)
 
 with st.expander("⚙️ Open Key Configurator, Mapping & Preview", expanded=True):
@@ -266,7 +294,6 @@ with st.expander("⚙️ Open Key Configurator, Mapping & Preview", expanded=Tru
             if found: cols.append(found)
         return cols
 
-    # Prioritize NAMES over IDs to match your manual mapping
     col_preferences = [
         ['CountryName', 'EcommerceCountry', 'Country', 'Country Name', 'country'],
         ['Ecom_Source', 'Source', 'Ecom Source', 'source'],
@@ -277,13 +304,11 @@ with st.expander("⚙️ Open Key Configurator, Mapping & Preview", expanded=Tru
     with st.form("key_mapping_form"):
         c1, c2, c3, c4 = st.columns(4)
         
-        # Pull actual columns
         scope_cols = scope_df.columns.tolist() if not scope_df.empty else []
         client_cols = client_df.columns.tolist() if not client_df.empty else []
         master_cols = master_df.columns.tolist() if not master_df.empty else []
         gs_cols = gsheet_df.columns.tolist() if not gsheet_df.empty else []
 
-        # Smart defaults
         scope_defs = guess_columns(scope_df, col_preferences)
         client_defs = guess_columns(client_df, col_preferences)
         master_defs = guess_columns(master_df, col_preferences)
@@ -302,13 +327,13 @@ with st.expander("⚙️ Open Key Configurator, Mapping & Preview", expanded=Tru
         st.session_state["client_keys"] = client_sel
         st.session_state["master_keys"] = master_sel
         st.session_state["gs_keys"] = gs_sel
-        st.success("Keys updated successfully! Check previews below.")
+        st.success("Keys updated successfully!")
 
     if "scope_keys" not in st.session_state:
-        st.session_state["scope_keys"] = scope_sel
-        st.session_state["client_keys"] = client_sel
-        st.session_state["master_keys"] = master_sel
-        st.session_state["gs_keys"] = gs_sel
+        st.session_state["scope_keys"] = scope_defs
+        st.session_state["client_keys"] = client_defs
+        st.session_state["master_keys"] = master_defs
+        st.session_state["gs_keys"] = gs_defs
 
 def create_eval_key(df: pd.DataFrame, cols: list) -> pd.Series:
     """Robust string conversion that drops trailing `.0` from ID floats before matching."""
@@ -317,7 +342,7 @@ def create_eval_key(df: pd.DataFrame, cols: list) -> pd.Series:
     for col in cols:
         if col in df.columns:
             s = df[col].astype(str)
-            s = s.str.replace(r'\.0$', '', regex=True) # Fix pandas float bug
+            s = s.str.replace(r'\.0$', '', regex=True)
             val = s.str.lower().str.replace(r'[\s\W_]+', '', regex=True)
             val = np.where(df[col].isna(), "missing", val)
             val = np.where(val == "nan", "missing", val)
@@ -338,15 +363,12 @@ gsheet_excluded_keys = set(gsheet_df['eval_key'].dropna().unique()) if not gshee
 
 # ── KEY PREVIEW UI ──
 with st.expander("👀 View Generated Key Previews", expanded=False):
-    st.write("Review a sample of how the keys are constructed.")
     p_c1, p_c2 = st.columns(2)
-    
     with p_c1:
         st.markdown("**Expected Scope Preview**")
         if not scope_df.empty and st.session_state["scope_keys"]:
             valid_scope_cols = [c for c in st.session_state["scope_keys"] if c in scope_df.columns]
             st.dataframe(scope_df[valid_scope_cols + ['eval_key']].head(3), use_container_width=True)
-            
     with p_c2:
         st.markdown("**Master SQL Preview**")
         if not master_df.empty and st.session_state["master_keys"]:
@@ -440,27 +462,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-
-
-
-# ── 9. CLIENT-WISE COMPREHENSIVE RECONCILIATION PIVOT ─────────────────────────
-st.markdown('<div class="section-header">📋 Client-Wise Master Reconciliation Pivot</div>', unsafe_allow_html=True)
-st.caption("ℹ️ Comprehensive breakdown showing total scope, live client deliveries, SQL master records, Google Sheet exclusions, and action required gaps.")
-
-# Aggregate summary pivot
-summary_pivot = filtered_scope.groupby(['Client', 'PlatformType'], observed=True).agg(
-    Total_In_Scope=('eval_key', 'count'),
-    Available_Client_Table=('Completeness_Status', lambda x: (x == 'Available (Client Table)').sum()),
-    Master_SQL_Records=('Completeness_Status', lambda x: (x == 'Master Records (Not in Client)').sum()),
-    Google_Sheet_Excluded=('Completeness_Status', lambda x: (x == 'Excluded (Google Sheet)').sum()),
-    Action_Required_Missing=('Completeness_Status', lambda x: (x == 'True Missing (Action Required)').sum())
-).reset_index()
-
-summary_pivot['Delivery Rate %'] = (summary_pivot['Available_Client_Table'] / summary_pivot['Total_In_Scope'] * 100).round(1)
-summary_pivot = summary_pivot.sort_values(by=['Client', 'Total_In_Scope'], ascending=[True, False]).reset_index(drop=True)
-
-st.dataframe(summary_pivot, use_container_width=True, height=400)    
-
 # ── 8. HOVER KPI CARDS ────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">📱 Platform Distribution (Hover for details)</div>', unsafe_allow_html=True)
 
@@ -472,7 +473,7 @@ def render_hover_cards(df, title):
     if df.empty:
         html += "<div style='text-align:center; color:#8b949e; margin-top:10px; font-size: 12px;'>No data available</div>\n"
     else:
-        grouped = df.groupby('Client').agg(
+        grouped = df.groupby('Client', observed=True).agg(
             Total=('eval_key', 'count'),
             Current=('Completeness_Status', lambda x: (x == 'Available (Client Table)').sum()),
             MasterOnly=('Completeness_Status', lambda x: (x == 'Master Records (Not in Client)').sum()),
@@ -499,12 +500,28 @@ st.markdown(f"""<div class="split-container">
 {render_hover_cards(app_df, "📱 App Platforms")}
 </div>""", unsafe_allow_html=True)
 
+# ── 9. CLIENT-WISE COMPREHENSIVE RECONCILIATION PIVOT ─────────────────────────
+st.markdown('<div class="section-header">📋 Client-Wise Master Reconciliation Pivot</div>', unsafe_allow_html=True)
+st.caption("ℹ️ Comprehensive breakdown showing total scope, live client deliveries, SQL master records, Google Sheet exclusions, and action required gaps.")
 
-# ── 9. CLIENT & COUNTRY-WISE PIVOT SUMMARY ───────────────────────────────────
+summary_pivot = filtered_scope.groupby(['Client', 'PlatformType'], observed=True).agg(
+    Total_In_Scope=('eval_key', 'count'),
+    Available_Client_Table=('Completeness_Status', lambda x: (x == 'Available (Client Table)').sum()),
+    Master_SQL_Records=('Completeness_Status', lambda x: (x == 'Master Records (Not in Client)').sum()),
+    Google_Sheet_Excluded=('Completeness_Status', lambda x: (x == 'Excluded (Google Sheet)').sum()),
+    Action_Required_Missing=('Completeness_Status', lambda x: (x == 'True Missing (Action Required)').sum())
+).reset_index()
+
+summary_pivot['Delivery Rate %'] = (summary_pivot['Available_Client_Table'] / summary_pivot['Total_In_Scope'] * 100).round(1)
+summary_pivot = summary_pivot.sort_values(by=['Client', 'Total_In_Scope'], ascending=[True, False]).reset_index(drop=True)
+
+st.dataframe(summary_pivot, use_container_width=True, height=400)    
+
+# ── 10. DETAILED BREAKDOWN SUMMARY ───────────────────────────────────────────
 st.markdown('<div class="section-header">📋 Detailed Breakdown Summary</div>', unsafe_allow_html=True)
 
 grp_cols = ['Client', 'CountryName', 'PlatformType', 'Ecom_Source']
-summary_pivot = filtered_scope.groupby(grp_cols, observed=True).agg(
+summary_detail = filtered_scope.groupby(grp_cols, observed=True).agg(
     Total_SKUs=('eval_key', 'count'),
     Client_Available=('Completeness_Status', lambda x: (x == 'Available (Client Table)').sum()),
     Master_Only=('Completeness_Status', lambda x: (x == 'Master Records (Not in Client)').sum()),
@@ -512,13 +529,12 @@ summary_pivot = filtered_scope.groupby(grp_cols, observed=True).agg(
     True_Missing=('Completeness_Status', lambda x: (x == 'True Missing (Action Required)').sum())
 ).reset_index()
 
-summary_pivot['Client Delivery %'] = (summary_pivot['Client_Available'] / summary_pivot['Total_SKUs'] * 100).round(1)
-summary_pivot = summary_pivot.sort_values(by=['Client', 'Total_SKUs'], ascending=[True, False]).reset_index(drop=True)
+summary_detail['Client Delivery %'] = (summary_detail['Client_Available'] / summary_detail['Total_SKUs'] * 100).round(1)
+summary_detail = summary_detail.sort_values(by=['Client', 'Total_SKUs'], ascending=[True, False]).reset_index(drop=True)
 
-st.dataframe(summary_pivot, use_container_width=True, height=400)
+st.dataframe(summary_detail, use_container_width=True, height=400)
 
-
-# ── 10. ACTION REQUIRED & MASTER REVIEW LIST ──────────────────────────────────
+# ── 11. ACTION REQUIRED & MASTER REVIEW LIST ──────────────────────────────────
 st.markdown('<div class="section-header">🔍 Deep Dive & Missing Actions</div>', unsafe_allow_html=True)
 
 status_filter = st.multiselect(

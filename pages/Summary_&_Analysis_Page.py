@@ -329,27 +329,27 @@ with col_bq:
     
     f1, f2 = st.columns(2)
     clients = ["All"] + list(bq_df['Client'].dropna().unique()) if 'Client' in bq_df.columns else ["All"]
-    sel_client = f1.selectbox("Filter Client", clients, key="az_client_split")
+    sel_client = f1.selectbox("Filter Client", clients, key="bq_client_split")
     
     filtered_bq = bq_df.copy()
     if sel_client != "All": filtered_bq = filtered_bq[filtered_bq['Client'] == sel_client]
     
     countries = ["All"] + list(filtered_bq['CountryName'].dropna().unique()) if 'CountryName' in filtered_bq.columns else ["All"]
-    sel_country = f2.selectbox("Filter Country", countries, key="az_country_split")
+    sel_country = f2.selectbox("Filter Country", countries, key="bq_country_split")
     
     if sel_country != "All": filtered_bq = filtered_bq[filtered_bq['CountryName'] == sel_country]
     
     # Default Source Type filter to Website based on master definitions
     source_types = ["Website", "App", "All"]
-    sel_source_type = st.selectbox("Filter Source Type", source_types, index=0, key="az_sourcetype_split")
+    sel_source_type = st.selectbox("Filter Source Type", source_types, index=0, key="bq_sourcetype_split")
     
     if sel_source_type != "All":
-        allowed_sources = master_df[master_df['PlatformType'] == sel_source_type]['Source'].unique()
+        allowed_sources = master_df[master_df['PlatformType'] == sel_source_type]['Source'].unique() if not master_df.empty else []
         if 'Ecom_Source' in filtered_bq.columns:
             filtered_bq = filtered_bq[filtered_bq['Ecom_Source'].isin(allowed_sources)]
 
     sources = ["All"] + list(filtered_bq['Ecom_Source'].dropna().unique()) if 'Ecom_Source' in filtered_bq.columns else ["All"]
-    sel_source = st.selectbox("Filter Source", sources, key="az_source_split")
+    sel_source = st.selectbox("Filter Source", sources, key="bq_source_split")
     
     if sel_source != "All": filtered_bq = filtered_bq[filtered_bq['Ecom_Source'] == sel_source]
     
@@ -372,20 +372,65 @@ with col_az:
     st.markdown("#### ☁️ Azure Storage (Vendor Data)")
     st.caption("Bulk ingested vendor data from Azure.")
     
-    if st.session_state.global_vendor_df is not None:
+    if st.session_state.get("global_vendor_df") is not None:
         v_df_all = st.session_state.global_vendor_df
         summary_meta = st.session_state.get("global_load_summary", {"total_found": len(v_df_all), "success": len(v_df_all), "failed": 0, "total_rows": len(v_df_all)})
         
-        st.info(f"📦 Total Loaded Rows in Memory: **{len(v_df_all):,}** across **{summary_meta.get('success', 0)}** files.")
+        # ── Azure Filtering Logic ──
+        f_az1, f_az2 = st.columns(2)
         
+        # Adjust column name mapping check if Azure uses different schema names (e.g., 'EcommerceCountry' or 'CountryName', 'Source' or 'Ecom_Source')
+        az_client_col = next((c for c in ['Client', 'client', 'Brand', 'brand'] if c in v_df_all.columns), None)
+        az_country_col = next((c for c in ['CountryName', 'Country', 'EcommerceCountry', 'country'] if c in v_df_all.columns), None)
+        az_source_col = next((c for c in ['Ecom_Source', 'Source', 'source', 'RetailerName'] if c in v_df_all.columns), None)
+        
+        az_clients = ["All"] + list(v_df_all[az_client_col].dropna().unique()) if az_client_col else ["All"]
+        sel_az_client = f_az1.selectbox("Filter Client (Azure)", az_clients, key="az_client_split")
+        
+        filtered_az = v_df_all.copy()
+        if sel_az_client != "All" and az_client_col: 
+            filtered_az = filtered_az[filtered_az[az_client_col] == sel_az_client]
+        
+        az_countries = ["All"] + list(filtered_az[az_country_col].dropna().unique()) if az_country_col else ["All"]
+        sel_az_country = f_az2.selectbox("Filter Country (Azure)", az_countries, key="az_country_split")
+        
+        if sel_az_country != "All" and az_country_col: 
+            filtered_az = filtered_az[filtered_az[az_country_col] == sel_az_country]
+        
+        az_source_types = ["Website", "App", "All"]
+        sel_az_source_type = st.selectbox("Filter Source Type (Azure)", az_source_types, index=0, key="az_sourcetype_split")
+        
+        if sel_az_source_type != "All" and not master_df.empty:
+            allowed_sources = master_df[master_df['PlatformType'] == sel_az_source_type]['Source'].unique()
+            if az_source_col:
+                filtered_az = filtered_az[filtered_az[az_source_col].isin(allowed_sources)]
+
+        az_sources = ["All"] + list(filtered_az[az_source_col].dropna().unique()) if az_source_col else ["All"]
+        sel_az_source = st.selectbox("Filter Source (Azure)", az_sources, key="az_source_split")
+        
+        if sel_az_source != "All" and az_source_col: 
+            filtered_az = filtered_az[filtered_az[az_source_col] == sel_az_source]
+        
+        id_col_az = next((c for c in ['id', 'Offerid', 'OfferID', 'SKU_ID'] if c in filtered_az.columns), filtered_az.columns[0])
+        unique_az_ids = filtered_az[id_col_az].nunique() if not filtered_az.empty else 0
+
+        st.markdown("##### 📌 Filtered Azure Scope Summary")
+        as1, as2, as3, as4 = st.columns(4)
+        as1.markdown(f'<div class="metric-box" style="padding:0.5rem;"><div class="metric-val" style="font-size:1.0rem;">{sel_az_client}</div><div class="metric-lbl">Client</div></div>', unsafe_allow_html=True)
+        as2.markdown(f'<div class="metric-box" style="padding:0.5rem;"><div class="metric-val" style="font-size:1.0rem;">{sel_az_country}</div><div class="metric-lbl">Country</div></div>', unsafe_allow_html=True)
+        as3.markdown(f'<div class="metric-box" style="padding:0.5rem;"><div class="metric-val" style="font-size:1.0rem;">{sel_az_source_type}</div><div class="metric-lbl">Type</div></div>', unsafe_allow_html=True)
+        as4.markdown(f'<div class="metric-box" style="padding:0.5rem; border-color:#4ade80;"><div class="metric-val" style="font-size:1.1rem; color:#4ade80;">{unique_az_ids:,}</div><div class="metric-lbl">Unique IDs</div></div>', unsafe_allow_html=True)
+        
+        st.success(f"✅ **{len(filtered_az):,}** filtered rows ready from Azure storage.")
+
         if st.button("🗑️ Clear Merged Azure Data", use_container_width=True):
             st.session_state.global_vendor_df = None
             st.session_state.global_load_summary = None
             if "az_match_results" in st.session_state: del st.session_state["az_match_results"]
             st.rerun()
             
-        with st.expander(f"👀 View Merged Azure Data Preview (Total: {len(v_df_all):,} rows)", expanded=False):
-            display_table(v_df_all.head(100), key="az_preview_split", height=250)
+        with st.expander(f"👀 View Filtered Azure Data Preview (Showing {len(filtered_az):,} rows)", expanded=False):
+            display_table(filtered_az.head(100), key="az_preview_split", height=250)
     else:
         st.warning("⚠️ No Azure data loaded yet. Click **'Run Bulk Ingestion'** above.")
 
